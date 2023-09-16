@@ -4,7 +4,6 @@ import zipfile
 from datetime import datetime
 import re
 
-import asyncpg
 import discord
 from discord.ext import commands
 
@@ -64,34 +63,6 @@ class Bot(commands.Bot):
     async def custom_context(self, message):
         return await self.get_context(message, cls=Context)
 
-    async def approve_asset(self, file, blurb, author, kind, *, created_at=None, name=None, approval='✅',
-                            rejection='❌'):
-        if name is None:
-            name = file.filename.rsplit('.', 1)[0]
-        msg = await self.assets_chn.send(f'{kind.upper()} {name}: {blurb}', file=file)
-        await msg.edit(content=f'{msg.content}\nFrom {author.mention}')
-        await msg.add_reaction(approval)
-        await msg.add_reaction(rejection)
-        file.reset()
-        return await self.approve_msg(msg, created_at, approval=approval, rejection=rejection)
-
-    async def approve_msg(self, msg, created_at=None, *, approval='✅', rejection='❌'):
-        def check(rxn, usr):
-            # ...not going to check role IDs anymore, because if someone has access to
-            # the caterer-assets channel it's likely a given that they're trusted
-            return usr.id != self.user.id and rxn.message.id == msg.id and rxn.emoji in (approval, rejection)
-
-        if created_at is None:
-            created_at = msg.created_at
-        rxn, _ = await self.wait_for('reaction_add', check=check)  # no timeout
-        await msg.delete()
-        # if it hasn't even been a minute yet, then they're probably still around to see
-        # the thumbs-up, so don't ping
-        should_ping = (datetime.now() - created_at).total_seconds() >= 60
-        if rxn.emoji == approval:
-            return True, should_ping
-        return False, should_ping
-
 
 bot = Bot(
     command_prefix=get_prefix,
@@ -139,10 +110,6 @@ async def on_ready():
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         ####
-        bot.pool = await asyncpg.create_pool(
-            ssl=context,
-            dsn=os.getenv('DATABASE_URL'), max_size=15, loop=bot.loop
-        )
         bot.assets_chn = bot.get_channel(424383992666783754)
         bot.owner = (await bot.application_info()).owner
         for cog in ('meta', 'wiki', 'ca', 'admin', 'db'):

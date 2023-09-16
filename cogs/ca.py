@@ -373,25 +373,6 @@ class CA(commands.Cog):
     def moreinfo(self, ctx):
         return f"'{ctx.prefix}help sim' for more info"
 
-    async def write_rule_from_generator(self, gen_name, rulestring, fp):
-        module = types.ModuleType('<custom>')
-        await self.loop.run_in_executor(None,
-                                        exec,
-                                        await self.loop.run_in_executor(None,
-                                                                        marshal.loads,
-                                                                        await self.bot.pool.fetchval(
-                                                                            '''SELECT module FROM algos WHERE name = $1::text''',
-                                                                            gen_name)
-                                                                        ),
-                                        module.__dict__
-                                        )
-        try:
-            rulestring = await self.loop.run_in_executor(None, module.rulestring, rulestring)
-        except AttributeError:
-            pass  # no need to modify rulestring then
-        fp.write(await self.loop.run_in_executor(None, module.main, rulestring))
-        return rulestring
-
     @mutils.group('Simulate an RLE and output to GIF', args=True)
     async def sim(
             self, ctx,
@@ -480,18 +461,7 @@ class CA(commands.Cog):
         rule = ''.join(rule.split()) or 'B3/S23'
 
         n_states = 2
-        if '::' in given_rule:
-            rulestring, name = given_rule.split('::')
-            rulestring = rulestring or rule.split('::')[0]
-            algo = f'RuleLoader::{name}'
-            with open(f'{self.dir}/{rulestring}_{ctx.message.id}.rule', 'w+') as ruleout:
-                rulestring = await self.write_rule_from_generator(name, rulestring, ruleout)
-                _, n_states, colors = mutils.extract_rule_info(ruleout, False)
-                bg, colors = mutils.colorpatch(colors, n_states, fg, bg)
-            rule = f'{rulestring}_{ctx.message.id}'
-            given_rule = rulestring
-            display_given_rule = True
-        elif rLtL.match(rule):
+        if rLtL.match(rule):
             algo = 'Larger than Life'
             n_states = 2 + int(rLtL.match(rule)[1])
         elif not rRULESTRING.fullmatch(rule) and rCAVIEWER.fullmatch(rule):
@@ -505,25 +475,19 @@ class CA(commands.Cog):
 
         if algo == 'RuleLoader':
             try:
-                rulename, rulefile, n_states, colors = await self.bot.pool.fetchrow('''
-                  SELECT name, file, n_states, colors FROM rules WHERE name = $1::text
-                ''', rule)
-            except TypeError:  # rule not found
-                # first, attempt to load rule from wiki
-                try:
-                    rulefile = bytes(await mutils.get_rule_from_wiki(rule, self.session), 'utf-8')
-                except FileNotFoundError:  # rule not found
-                    return await ctx.send('`Error: Rule not found`')
+                rulefile = bytes(await mutils.get_rule_from_wiki(rule, self.session), 'utf-8')
+            except FileNotFoundError:  # rule not found
+                return await ctx.send('`Error: Rule not found`')
 
-                rulename, n_states, colors = await self.loop.run_in_executor(
-                    None,
-                    mutils.extract_rule_info,
-                    rulefile
-                )
-                if not n_states:
-                    return await ctx.send('Error: n_states not found in rule fetched from wiki')
-                if not rulename:
-                    return await ctx.send('Error: rulename not found in rule fetched from wiki')
+            rulename, n_states, colors = await self.loop.run_in_executor(
+                None,
+                mutils.extract_rule_info,
+                rulefile
+            )
+            if not n_states:
+                return await ctx.send('Error: n_states not found in rule fetched from wiki')
+            if not rulename:
+                return await ctx.send('Error: rulename not found in rule fetched from wiki')
 
             bg, colors = mutils.colorpatch(json.loads(colors), n_states, fg, bg)
             with open(f'{self.dir}/{rulename}_{ctx.message.id}.rule', 'wb') as ruleout:
@@ -808,287 +772,6 @@ class CA(commands.Cog):
             )
         await ctx.send(embed=discord.Embed(title='Last 5 sims', description='\n'.join(entries)))
 
-    @mutils.command('Show uploaded rules')
-    async def rules(self, ctx, rule=None):
-        """
-        # If no argument is passed, displays all rules (paginated by tens). #
-        <[ARGS]>
-        RULE: Rulename. If a rule by this name (case-sensitive) has been uploaded, displays that rule's info and gives its rulefile.
-        [or]
-        MEMBER: If the member mentioned is present in the server, shows rules uploaded by them.
-        """
-        if self.rulecache is None:
-            self.rulecache = [
-                {'name': i['name'], 'blurb': i['blurb'], 'file': i['file'], 'uploader': i['uploader']}
-                for i in
-                await self.bot.pool.fetch(f'''SELECT DISTINCT ON (name) name, uploader, file, blurb FROM rules''')
-            ]
-        if rule is None:
-            offset = 0
-            say, msg = ctx.send, None
-            while True:
-                msg = await say(embed=discord.Embed(
-                    title='Rules',
-                    description='\n'.join(
-                        f"• {i['name']} ({get_member_bismuth(ctx.guild, i['uploader'])}): {i['blurb']}"
-                        for i in islice(self.rulecache, offset, offset + 10)
-                    )
-                )) or msg
-                say = msg.edit
-                left, right = await mutils.get_page(ctx, msg)
-                if left:
-                    offset = max(0, offset - 10)
-                elif right:
-                    offset += offset + 10 < len(self.rulecache) and 10
-        try:
-            member = await commands.MemberConverter().convert(ctx, rule)
-        except commands.BadArgument:
-            try:
-                rule = next(d for d in self.rulecache if d['name'] == rule)
-                with io.BytesIO(rule['file']) as b:
-                    b.seek(0)
-                    return await ctx.send(embed=discord.Embed(
-                        title=rule['name'],
-                        description=f"Uploader: {self.bot.get_user(rule['uploader'])}\nBlurb: {rule['blurb']}"
-                    ),
-                        file=discord.File(b, rule['name'] + '.rule')
-                    )
-            except StopIteration: # find rule failed
-                em = discord.Embed(title=f'Rule:{rule}', description='LifeWiki rule', type='rich',
-                                   url=f'https://conwaylife.com/wiki/Rule:{rule}')
-                file = io.BytesIO(bytes(await mutils.get_rule_from_wiki(rule, self.session), encoding="utf-8")) # oh no another nested try/except?
-                return await ctx.send(embed=em, file=discord.File(file, filename=f"{rule}.rule"))
-        else:
-            return await ctx.send(embed=discord.Embed(
-                title=f'Rules by {member}',
-                description='\n'.join(
-                    f"• {d['name']}: {d['blurb']}"
-                    for d in self.rulecache
-                    if d['uploader'] == member.id
-                )
-            ))
-
-    async def _insert_rule(self, *args):
-        query = '''
-        INSERT INTO rules (
-          uploader, blurb, file, name, n_states, colors
-        )
-        SELECT $1::bigint, $2::text, $3::bytea, $4::text, $5::int, $6::text
-            ON CONFLICT (name)
-            DO UPDATE
-           SET uploader=$1::bigint, blurb=$2::text, file=$3::bytea, name=$4::text, n_states=$5::int, colors=$6::text
-        '''
-        await self.bot.pool.execute(query, *args)
-        self.rulecache = None
-
-    async def _insert_generator(self, *args):
-        await self.bot.pool.execute('''
-          INSERT INTO algos (
-              name, uploader, plaintext, module, blurb
-          )
-          SELECT $1::text, $2::bigint, $3::bytea, $4::bytea, $5::text
-              ON CONFLICT (name)
-              DO UPDATE
-              SET uploader=$2::bigint, plaintext=$3::bytea, module=$4::bytea, blurb=COALESCE(algos.blurb, $5::text)
-          ''',
-                                    *args
-                                    )
-
-    @mutils.command('Upload an asset (just ruletables for now)')
-    async def upload(self, ctx, *, blurb=''):
-        """
-        # Attach a ruletable file to this command to have it reviewed by Conwaylife Lounge moderators. #
-        # If acceptable, it will be added to Caterer and be usable in !sim. #
-        <[ARGS]>
-        BLURB: Short description of this rule. Min 10 characters, max 90.
-        """
-        if len(blurb) < 10:
-            return await ctx.send('Please provide a short justification/explanation of this rule! Min 10 characters.')
-        if len(blurb) > 90:
-            return await ctx.send('Please shorten your description. Max 90 characters.')
-        await ctx.message.add_reaction('⌛')
-        attachment = ctx.message.attachments[0]
-        file = await attachment.to_file()
-        approved, should_ping = await self.bot.approve_asset(file, blurb, ctx.author, 'rule')
-        await ctx.message.remove_reaction('⌛', ctx.guild.me)
-        if approved:
-            await self._insert_rule(ctx.author.id, blurb, await attachment.read(), *mutils.extract_rule_info(file.fp))
-            self.rulecache = None
-            await ctx.thumbsup(ctx.author, f'Rule `{attachment.filename}` was approved!', should_ping)
-        await ctx.thumbsdown(ctx.author, f'Rule `{attachment.filename}` was rejected or not parsable.', override=False)
-
-    async def _reapprove(self, ctx, created_at, file, name, blurb, author, kind):
-        approved, should_ping = await self.bot.approve_asset(file, blurb, author, kind, created_at=created_at,
-                                                             name=name)
-        if approved:
-            content = file.fp.read()
-            file.reset()
-            if kind == 'rule':
-                await self._insert_rule(ctx.author.id, blurb, content, *mutils.extract_rule_info(file.fp))
-            elif kind == 'generator':
-                await self._insert_generator(
-                    name, ctx.author.id, content,
-                    await self.loop.run_in_executor(
-                        None,
-                        marshal.dumps,
-                        await self.loop.run_in_executor(None, compile, content, '<custom>', 'exec', 0, False, 2)
-                    ),
-                    blurb
-                )
-            await ctx.thumbsup(author, f'{kind.upper()} `{name}` was accepted!', channel=self.BOTS_N_MUTE)
-        await ctx.thumbsdown(author, f'{kind.upper()} `{name}` was rejected or not parsable.', override=False,
-                             channel=self.BOTS_N_MUTE)
-
-    @mutils.command()
-    async def reup(self, ctx):
-        if ctx.channel.id != ASSETS:
-            return await ctx.thumbsdown()
-        coros = []
-        async for msg in ctx.channel.history().filter(lambda msg: msg.author == self.bot.user):
-            pre, blurb = msg.content.split('\n', 1)[0].split(':', 1)
-            kind, name = pre.split(' ')
-            coros.append(self._reapprove(
-                ctx,
-                msg.created_at,
-                # technically still works (only a minor delay btwn user invoking !upload/!register and btwn caterer posting this msg)
-                await msg.attachments[0].to_file(),
-                name,
-                blurb,
-                msg.mentions[-1],
-                kind
-            ))
-            await msg.delete()
-        await ctx.thumbsup()
-        await asyncio.wait(coros)
-
-    @mutils.command()
-    async def delrule(self, ctx, name):
-        and_condition = ''
-        if not await self.bot.is_owner(ctx.author):
-            and_condition = 'AND uploader = $2::bigint'
-        try:
-            if name.startswith('user:'):
-                status = await self.bot.pool.execute(
-                    f'''DELETE FROM rules WHERE uploader = $1::bigint {and_condition}''',
-                    *(
-                         (await commands.MemberConverter().convert(ctx, name[1 + name.index(':'):])).id,
-                         ctx.author.id
-                     )[:1 + bool(and_condition)]
-                )
-            else:
-                status = await self.bot.pool.execute(
-                    f'''DELETE FROM rules WHERE name = $1::text {and_condition}''',
-                    *(name, ctx.author.id)[:1 + bool(and_condition)]
-                )
-        except:
-            await ctx.thumbsdown()
-            raise
-        if int(status.split()[-1]) == 0:
-            return await ctx.thumbsdown()
-        self.rulecache = None
-        await ctx.thumbsup()
-
-    @mutils.command('Register a custom rulefile-generating python script')
-    async def register(self, ctx, name, *, blurb):
-        """
-        # Register a custom rulefile-generating python module. #
-        # Must be compatible with Python 3.6, and additionally must #
-        # contain a "main()" function that can be called with a single #
-        # rulestring argument (the user's input) to produce a rulefile. #
-        #
-        # Due to bad-design-related limitations, your rulestrings must be filename-safe. #
-        # If they're not, e.g. if they contain slashes, you must define a rulestring() #
-        # function that normalizes inputted rulestrings to be filename-safe. #
-        # Your main() function will be passed this new rulestring, not the original. #
-
-        <[ARGS]>
-        NAME: The name, to be separated from a rulestring by two colons, that users will invoke your script with from {prefix}sim.
-        BLURB: A short (10-to-90-character) description of your script and the rulefile it generates.
-        """
-        if not blurb:
-            blurb = None
-        attachment = ctx.message.attachments[0]
-        file = await attachment.to_file()
-        approved, should_ping = self.bot.approve_asset(file, blurb, ctx.author, 'generator', name=name)
-        if approved:
-            code = await attachment.read()
-            await self._insert_generator(
-                name, ctx.author.id, code,
-                await self.loop.run_in_executor(
-                    None,
-                    marshal.dumps,
-                    await self.loop.run_in_executor(None, compile, code, '<custom>', 'exec', 0, False, 2)
-                ),
-                blurb
-            )
-            self.gencache = None
-            await ctx.thumbsup(ctx.author, f'Generator {name} was approved!', should_ping)
-        await ctx.thumbsdown(ctx.author, f'Generator {name} was rejected or not parsable.', should_ping, override=False)
-
-    @mutils.command('Show uploaded generators')
-    async def generators(self, ctx, text=None, *, flags: mutils.parse_flags = None):
-        """
-        # If no argument is passed, displays all generators (paginated by tens). #
-        <[ARGS]>
-        GENERATOR: Generator's name. If a generator by this name (case-sensitive) has been uploaded, displays its info and gives its file.
-        [or]
-        MEMBER: If the member mentioned is present in the server, shows generators uploaded by them.
-
-        <[FLAGS]>
-        -rule: A rulestring. If the string passed above is a generator name, then attached to Caterer's response (instead of the generator's Python file) will be a rulefile generated by running the named generator on this rulestring.
-        """
-        if flags is None:
-            flags = {}
-        if self.gencache is None:
-            self.gencache = [
-                {'name': i['name'], 'uploader': i['uploader'], 'blurb': i['blurb'], 'plaintext': i['plaintext']}
-                for i in
-                await self.bot.pool.fetch(f'''SELECT DISTINCT ON (name) name, uploader, plaintext, blurb FROM algos''')
-            ]
-        if text is None:
-            offset = 0
-            say, msg = ctx.send, None
-            while True:
-                msg = await say(embed=discord.Embed(
-                    title='Rules',
-                    description='\n'.join(
-                        f"• {i['name']} ({get_member_bismuth(ctx.guild, i['uploader'])}): {i['blurb']}"
-                        for i in islice(self.gencache, offset, offset + 10)
-                    )
-                )) or msg
-                say = msg.edit
-                left, right = await mutils.get_page(ctx, msg)
-                if left:
-                    offset = max(0, offset - 10)
-                elif right:
-                    offset += offset + 10 < len(self.gencache) and 10
-        try:
-            member = await commands.MemberConverter().convert(ctx, text)
-        except commands.BadArgument:
-            if 'rule' in flags:
-                with io.StringIO() as s:
-                    rulestring = await self.write_rule_from_generator(text, flags['rule'], s)
-                    s.seek(0)
-                    return await ctx.send(file=discord.File(s, rulestring + '.rule'))
-            gen = next(d for d in self.gencache if d['name'] == text)
-            with io.StringIO(gen['plaintext']) as s:
-                s.seek(0)
-                return await ctx.send(embed=discord.Embed(
-                    title=gen['name'],
-                    description=f"Uploader: {self.bot.get_user(gen['uploader'])}\nBlurb: {gen['blurb']}"
-                ),
-                    file=discord.File(s, gen['name'] + '.py')
-                )
-        else:
-            return await ctx.send(embed=discord.Embed(
-                title=f'Generators by {member}',
-                description='\n'.join(
-                    f"• {d['name']}: {d['blurb']}"
-                    for d in self.gencache
-                    if d['uploader'] == member.id
-                )
-            ))
-
     @mutils.command('Generates a *.rule file with CAViewer')
     async def generate_apgtable(self, ctx, rule, name):
         """
@@ -1219,42 +902,6 @@ class CA(commands.Cog):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out = await self.bot.loop.run_in_executor(None, p.communicate)
         return out
-
-    @mutils.command()
-    async def delgen(self, ctx, name):
-        if not await self.bot.is_owner(ctx.author):
-            return
-        try:
-            await self.bot.pool.execute('''DELETE FROM algos WHERE name = $1::text''', name)
-        except:
-            await ctx.thumbsdown()
-            raise
-        self.gencache = None
-        await ctx.thumbsup()
-
-    @mutils.command()
-    async def updatepyc(self, ctx):
-        if not await self.bot.is_owner(ctx.author):
-            return
-        for plaintext, name in await self.bot.pool.fetch('''SELECT plaintext, name FROM algos'''):
-            await self.bot.pool.execute(
-                '''
-              UPDATE algos
-              SET module=$1::bytea
-              WHERE name=$2::text
-              ''',
-                await self.loop.run_in_executor(
-                    None,
-                    marshal.dumps,
-                    await self.loop.run_in_executor(None,
-                                                    compile,
-                                                    plaintext, f"<generator '{name}'>",
-                                                    'exec'
-                                                    ),
-                ),
-                name
-            )
-        await ctx.thumbsup()
 
 
 def setup(bot):
